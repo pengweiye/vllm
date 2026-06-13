@@ -2,10 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with FlashAttention."""
 from dataclasses import dataclass
+import os
 from typing import Optional
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from vllm import _custom_ops as ops
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
@@ -35,6 +37,41 @@ logger = init_logger(__name__)
 
 # NOTE(woosuk): This is an arbitrary number. Tune it if needed.
 _DEFAULT_MAX_NUM_SPLITS_FOR_CUDA_GRAPH = 16
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        logger.warning_once("Ignoring invalid integer value for %s: %s", name,
+                            value)
+        return default
+
+
+def _env_int_set(name: str,
+                 default: Optional[set[int]] = None) -> Optional[set[int]]:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    value = value.strip()
+    if value in ("*", "all", "ALL"):
+        return None
+    try:
+        return {int(part.strip()) for part in value.split(",") if part.strip()}
+    except ValueError:
+        logger.warning_once("Ignoring invalid layer list for %s: %s", name,
+                            value)
+        return default
 
 
 class FlashAttentionBackend(AttentionBackend):
@@ -226,7 +263,7 @@ class FlashAttentionMetadataBuilder(
               common_attn_metadata: CommonAttentionMetadata,
               fast_build: bool = False) -> FlashAttentionMetadata:
         """
-        fast_build disables AOT scheduling, used when there will be few 
+        fast_build disables AOT scheduling, used when there will be few
         iterations i.e. spec-decode
         """
         num_reqs = common_attn_metadata.num_reqs
@@ -419,6 +456,37 @@ class FlashAttentionImpl(AttentionImpl):
                 "Sinks must have the same number of heads as the number of "
                 "heads in the layer")
 
+        # Experimental SnapKV prototype. This intentionally does not change the
+        # physical paged KV cache layout. It keeps a side compact dense cache
+        # per layer, matching the original SnapKV execution shape more closely:
+        # compress once after prefill, then append generated K/V to that compact
+        # cache during decode.
+        self.snapkv_enabled = _env_flag("VLLM_SNAPKV")
+        self.snapkv_window_size = max(1, _env_int("VLLM_SNAPKV_WINDOW_SIZE",
+                                                 32))
+        self.snapkv_max_capacity = max(
+            self.snapkv_window_size,
+            _env_int("VLLM_SNAPKV_MAX_CAPACITY", 512))
+        self.snapkv_kernel_size = max(1, _env_int("VLLM_SNAPKV_KERNEL_SIZE",
+                                                 7))
+        if self.snapkv_kernel_size % 2 == 0:
+            self.snapkv_kernel_size += 1
+        self.snapkv_append_capacity = max(
+            1, _env_int("VLLM_SNAPKV_APPEND_CAPACITY", 1024))
+        self.snapkv_debug = _env_flag("VLLM_SNAPKV_DEBUG")
+        self.snapkv_debug_layers = _env_int_set("VLLM_SNAPKV_DEBUG_LAYERS",
+                                                {0})
+        self.snapkv_debug_decode_steps = max(
+            0, _env_int("VLLM_SNAPKV_DEBUG_DECODE_STEPS", 3))
+        self._snapkv_prompt_len = 0
+        self._snapkv_selected_history: Optional[torch.Tensor] = None
+        self._snapkv_compact_key_cache: Optional[torch.Tensor] = None
+        self._snapkv_compact_value_cache: Optional[torch.Tensor] = None
+        self._snapkv_compact_kv_len = 0
+        self._snapkv_warned_unsupported = False
+        self._snapkv_decode_debug_count = 0
+        self._snapkv_fallback_reasons_logged: set[str] = set()
+
     def forward(
         self,
         layer: torch.nn.Module,
@@ -518,6 +586,30 @@ class FlashAttentionImpl(AttentionImpl):
                 layer._q_scale)
             query = query.reshape((num_tokens, num_heads, head_size))
 
+        if self.snapkv_enabled:
+            unsupported_reason = self._snapkv_unsupported_reason(
+                attn_metadata)
+            if unsupported_reason is not None:
+                self._snapkv_log_fallback(layer, unsupported_reason)
+            elif self._snapkv_is_full_prefill(query, key, value,
+                                              attn_metadata):
+                self._snapkv_update_prefill_state(layer,
+                                                  query[:num_actual_tokens],
+                                                  key[:num_actual_tokens],
+                                                  value[:num_actual_tokens])
+            elif self._snapkv_can_run_decode(query, attn_metadata):
+                if (key is not None and value is not None
+                        and self._snapkv_forward_decode(
+                            query, key[:num_actual_tokens],
+                            value[:num_actual_tokens], attn_metadata, output,
+                            layer)):
+                    return output
+            else:
+                reason = self._snapkv_inactive_reason(query, key, value,
+                                                      attn_metadata)
+                if reason is not None:
+                    self._snapkv_log_fallback(layer, reason)
+
         if not attn_metadata.use_cascade:
             cu_seqlens_q = attn_metadata.query_start_loc
             seqused_k = attn_metadata.seq_lens
@@ -579,6 +671,413 @@ class FlashAttentionImpl(AttentionImpl):
             v_descale=layer._v_scale,
         )
         return output
+
+    def _snapkv_unsupported_reason(
+        self,
+        attn_metadata: FlashAttentionMetadata,
+    ) -> Optional[str]:
+        if self.attn_type != AttentionType.DECODER:
+            return f"unsupported attention type: {self.attn_type}"
+        if self.kv_cache_dtype.startswith("fp8"):
+            if not self._snapkv_warned_unsupported:
+                logger.warning_once("SnapKV prototype does not support fp8 "
+                                    "KV cache; falling back to vLLM attention.")
+                self._snapkv_warned_unsupported = True
+            return "fp8 KV cache is unsupported"
+        if attn_metadata.use_cascade:
+            return "cascade or prefix attention metadata is unsupported"
+        if attn_metadata.block_table.shape[0] != 1:
+            return (f"batch size is {attn_metadata.block_table.shape[0]}, "
+                    "expected 1")
+        if attn_metadata.query_start_loc.shape[0] != 2:
+            return "query_start_loc does not describe a single request"
+        if self.kv_sharing_target_layer_name is not None:
+            return "KV sharing target layers are unsupported"
+        if self.alibi_slopes is not None:
+            return "ALiBi attention is unsupported"
+        if self.sinks is not None:
+            return "attention sinks are unsupported"
+        return None
+
+    def _snapkv_inactive_reason(
+        self,
+        query: torch.Tensor,
+        key: Optional[torch.Tensor],
+        value: Optional[torch.Tensor],
+        attn_metadata: FlashAttentionMetadata,
+    ) -> Optional[str]:
+        if query.shape[0] == 1:
+            if self._snapkv_selected_history is None:
+                return "decode skipped because no prefill state exists"
+            if (self._snapkv_compact_key_cache is None
+                    or self._snapkv_compact_value_cache is None):
+                return "decode skipped because compact KV cache is missing"
+            seq_len = int(attn_metadata.seq_lens[0].item())
+            if self._snapkv_prompt_len <= 0:
+                return "decode skipped because prompt_len is not initialized"
+            if seq_len <= self._snapkv_prompt_len:
+                return "decode skipped because seq_len has not passed prompt_len"
+            return None
+        if key is None or value is None:
+            return "prefill skipped because key/value are missing"
+        seq_len = int(attn_metadata.seq_lens[0].item())
+        if seq_len != query.shape[0]:
+            return (f"prefill skipped because chunked prefill is active "
+                    f"(query_len={query.shape[0]}, seq_len={seq_len})")
+        return None
+
+    def _snapkv_layer_name(self, layer: torch.nn.Module) -> str:
+        return str(getattr(layer, "layer_name", "<unknown>"))
+
+    def _snapkv_layer_index(self, layer: torch.nn.Module) -> Optional[int]:
+        ints: list[int] = []
+        for part in self._snapkv_layer_name(layer).split("."):
+            try:
+                ints.append(int(part))
+            except ValueError:
+                continue
+        if len(ints) != 1:
+            return None
+        return ints[0]
+
+    def _snapkv_should_log_layer(self, layer: torch.nn.Module) -> bool:
+        if not self.snapkv_debug:
+            return False
+        if self.snapkv_debug_layers is None:
+            return True
+        layer_idx = self._snapkv_layer_index(layer)
+        return layer_idx in self.snapkv_debug_layers
+
+    def _snapkv_log_fallback(self, layer: torch.nn.Module,
+                             reason: str) -> None:
+        if not self._snapkv_should_log_layer(layer):
+            return
+        layer_name = self._snapkv_layer_name(layer)
+        key = f"{layer_name}:{reason}"
+        if key in self._snapkv_fallback_reasons_logged:
+            return
+        self._snapkv_fallback_reasons_logged.add(key)
+        logger.info("SnapKV fallback layer=%s reason=%s", layer_name, reason)
+
+    def _snapkv_log_prefill(self, layer: torch.nn.Module, prompt_len: int,
+                            obs_len: int, history_len: int,
+                            selected_len: int) -> None:
+        if not self._snapkv_should_log_layer(layer):
+            return
+        compression_ratio = ((selected_len + obs_len) / prompt_len
+                             if prompt_len > 0 else 0.0)
+        logger.info(
+            "SnapKV prefill layer=%s prompt_len=%d obs_len=%d "
+            "history_len=%d selected_len=%d max_capacity=%d "
+            "compression_ratio=%.3f",
+            self._snapkv_layer_name(layer),
+            prompt_len,
+            obs_len,
+            history_len,
+            selected_len,
+            self.snapkv_max_capacity,
+            compression_ratio,
+        )
+
+    def _snapkv_log_decode(self, layer: torch.nn.Module, seq_len: int,
+                           prompt_len: int, selected_len: int,
+                           recent_len: int, generated_len: int,
+                           kv_len: int) -> None:
+        self._snapkv_decode_debug_count += 1
+        if not self._snapkv_should_log_layer(layer):
+            return
+        if self._snapkv_decode_debug_count > self.snapkv_debug_decode_steps:
+            return
+        logger.info(
+            "SnapKV decode layer=%s step=%d seq_len=%d prompt_len=%d "
+            "selected_len=%d recent_len=%d generated_len=%d kv_len=%d "
+            "used=snapkv_compact_cache_decode",
+            self._snapkv_layer_name(layer),
+            self._snapkv_decode_debug_count,
+            seq_len,
+            prompt_len,
+            selected_len,
+            recent_len,
+            generated_len,
+            kv_len,
+        )
+
+    def _snapkv_is_full_prefill(
+        self,
+        query: torch.Tensor,
+        key: Optional[torch.Tensor],
+        value: Optional[torch.Tensor],
+        attn_metadata: FlashAttentionMetadata,
+    ) -> bool:
+        if key is None or value is None:
+            return False
+        if query.shape[0] <= 1:
+            return False
+        # With chunked prefill disabled, the first request step has computed
+        # exactly the prompt tokens contained in this forward pass.
+        return int(attn_metadata.seq_lens[0].item()) == query.shape[0]
+
+    def _snapkv_can_run_decode(
+        self,
+        query: torch.Tensor,
+        attn_metadata: FlashAttentionMetadata,
+    ) -> bool:
+        if query.shape[0] != 1:
+            return False
+        if self._snapkv_selected_history is None:
+            return False
+        if (self._snapkv_compact_key_cache is None
+                or self._snapkv_compact_value_cache is None):
+            return False
+        seq_len = int(attn_metadata.seq_lens[0].item())
+        return self._snapkv_prompt_len > 0 and seq_len > self._snapkv_prompt_len
+
+    def _snapkv_update_prefill_state(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> None:
+        prompt_len = query.shape[0]
+        obs_len = min(self.snapkv_window_size, prompt_len)
+        history_len = prompt_len - obs_len
+        device = query.device
+
+        if history_len <= 0:
+            selected = torch.empty((self.num_heads, 0),
+                                   dtype=torch.long,
+                                   device=device)
+            self._snapkv_prompt_len = prompt_len
+            self._snapkv_selected_history = selected
+            self._snapkv_init_compact_cache(key, value, selected, obs_len)
+            self._snapkv_decode_debug_count = 0
+            self._snapkv_log_prefill(layer, prompt_len, obs_len, history_len,
+                                     selected.shape[1])
+            self._snapkv_log_fallback(
+                layer, "prompt too short; recent window covers full prompt")
+            return
+
+        budget = min(max(self.snapkv_max_capacity - obs_len, 0), history_len)
+        if budget == history_len:
+            selected = torch.arange(history_len,
+                                    dtype=torch.long,
+                                    device=device).expand(
+                                        self.num_heads, -1).contiguous()
+            self._snapkv_prompt_len = prompt_len
+            self._snapkv_selected_history = selected
+            self._snapkv_init_compact_cache(key, value, selected, obs_len)
+            self._snapkv_decode_debug_count = 0
+            self._snapkv_log_prefill(layer, prompt_len, obs_len, history_len,
+                                     selected.shape[1])
+            self._snapkv_log_fallback(
+                layer, "prompt shorter than SnapKV capacity; no compression")
+            return
+
+        if budget == 0:
+            selected = torch.empty((self.num_heads, 0),
+                                   dtype=torch.long,
+                                   device=device)
+            self._snapkv_prompt_len = prompt_len
+            self._snapkv_selected_history = selected
+            self._snapkv_init_compact_cache(key, value, selected, obs_len)
+            self._snapkv_decode_debug_count = 0
+            self._snapkv_log_prefill(layer, prompt_len, obs_len, history_len,
+                                     selected.shape[1])
+            return
+
+        # SnapKV scores historical tokens by the attention mass from the
+        # observation window at the prompt tail. K is expanded to query heads so
+        # each query head gets its own top-k history.
+        q_obs = query[-obs_len:].transpose(0, 1).float()
+        k_rep = key.repeat_interleave(self.num_queries_per_kv,
+                                      dim=1).transpose(0, 1).float()
+        scores = torch.matmul(q_obs, k_rep.transpose(-2, -1)) * self.scale
+
+        q_pos = torch.arange(prompt_len - obs_len,
+                             prompt_len,
+                             device=device).unsqueeze(1)
+        k_pos = torch.arange(prompt_len, device=device).unsqueeze(0)
+        causal_mask = k_pos <= q_pos
+        scores = scores.masked_fill(~causal_mask.unsqueeze(0),
+                                    torch.finfo(scores.dtype).min)
+        attn = torch.softmax(scores, dim=-1, dtype=torch.float32)
+        history_scores = attn[:, :, :history_len].sum(dim=1)
+
+        kernel_size = min(self.snapkv_kernel_size,
+                          history_scores.shape[-1] |
+                          1)  # Keep the pooling kernel odd.
+        pooled = F.avg_pool1d(history_scores.unsqueeze(1),
+                              kernel_size=kernel_size,
+                              padding=kernel_size // 2,
+                              stride=1).squeeze(1)
+        pooled = pooled[:, :history_len]
+        selected = pooled.topk(budget, dim=-1).indices
+        selected = selected.sort(dim=-1).values.to(torch.long)
+
+        self._snapkv_prompt_len = prompt_len
+        self._snapkv_selected_history = selected
+        self._snapkv_init_compact_cache(key, value, selected, obs_len)
+        self._snapkv_decode_debug_count = 0
+        self._snapkv_log_prefill(layer, prompt_len, obs_len, history_len,
+                                 selected.shape[1])
+
+    def _snapkv_init_compact_cache(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        selected_history: torch.Tensor,
+        obs_len: int,
+    ) -> None:
+        prompt_len = key.shape[0]
+        selected_len = selected_history.shape[1]
+        recent_start = max(0, prompt_len - obs_len)
+
+        key_by_head = key.repeat_interleave(self.num_queries_per_kv,
+                                            dim=1).transpose(0, 1)
+        value_by_head = value.repeat_interleave(self.num_queries_per_kv,
+                                                dim=1).transpose(0, 1)
+
+        key_parts = []
+        value_parts = []
+        if selected_len > 0:
+            gather_index = selected_history.unsqueeze(-1).expand(
+                -1, -1, self.head_size)
+            key_parts.append(key_by_head.gather(1, gather_index))
+            value_parts.append(value_by_head.gather(1, gather_index))
+        if obs_len > 0:
+            key_parts.append(key_by_head[:, recent_start:prompt_len])
+            value_parts.append(value_by_head[:, recent_start:prompt_len])
+
+        compact_key = torch.cat(key_parts, dim=1).transpose(0, 1).contiguous()
+        compact_value = torch.cat(value_parts,
+                                  dim=1).transpose(0, 1).contiguous()
+        compact_len = compact_key.shape[0]
+        cache_capacity = compact_len + self.snapkv_append_capacity
+
+        key_cache = torch.empty((cache_capacity, self.num_heads,
+                                 self.head_size),
+                                dtype=compact_key.dtype,
+                                device=compact_key.device)
+        value_cache = torch.empty_like(key_cache)
+        key_cache[:compact_len].copy_(compact_key)
+        value_cache[:compact_len].copy_(compact_value)
+
+        self._snapkv_compact_key_cache = key_cache
+        self._snapkv_compact_value_cache = value_cache
+        self._snapkv_compact_kv_len = compact_len
+
+    def _snapkv_grow_compact_cache(self) -> None:
+        key_cache = self._snapkv_compact_key_cache
+        value_cache = self._snapkv_compact_value_cache
+        if key_cache is None or value_cache is None:
+            return
+
+        old_capacity = key_cache.shape[0]
+        new_capacity = max(old_capacity * 2, old_capacity + 1)
+        new_key_cache = torch.empty((new_capacity, self.num_heads,
+                                     self.head_size),
+                                    dtype=key_cache.dtype,
+                                    device=key_cache.device)
+        new_value_cache = torch.empty_like(new_key_cache)
+        new_key_cache[:self._snapkv_compact_kv_len].copy_(
+            key_cache[:self._snapkv_compact_kv_len])
+        new_value_cache[:self._snapkv_compact_kv_len].copy_(
+            value_cache[:self._snapkv_compact_kv_len])
+        self._snapkv_compact_key_cache = new_key_cache
+        self._snapkv_compact_value_cache = new_value_cache
+
+    def _snapkv_append_current_kv(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> bool:
+        key_cache = self._snapkv_compact_key_cache
+        value_cache = self._snapkv_compact_value_cache
+        if key_cache is None or value_cache is None:
+            return False
+        if key.shape[0] != 1 or value.shape[0] != 1:
+            return False
+
+        if self._snapkv_compact_kv_len >= key_cache.shape[0]:
+            self._snapkv_grow_compact_cache()
+            key_cache = self._snapkv_compact_key_cache
+            value_cache = self._snapkv_compact_value_cache
+            if key_cache is None or value_cache is None:
+                return False
+
+        current_key = key.repeat_interleave(self.num_queries_per_kv, dim=1)
+        current_value = value.repeat_interleave(self.num_queries_per_kv, dim=1)
+        key_cache[self._snapkv_compact_kv_len].copy_(current_key[0])
+        value_cache[self._snapkv_compact_kv_len].copy_(current_value[0])
+        self._snapkv_compact_kv_len += 1
+        return True
+
+    def _snapkv_forward_decode(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: FlashAttentionMetadata,
+        output: torch.Tensor,
+        layer: torch.nn.Module,
+    ) -> bool:
+        selected_history = self._snapkv_selected_history
+        if selected_history is None:
+            return False
+
+        prompt_len = self._snapkv_prompt_len
+        seq_len = int(attn_metadata.seq_lens[0].item())
+        if seq_len <= prompt_len:
+            return False
+
+        if not self._snapkv_append_current_kv(key, value):
+            return False
+
+        key_cache = self._snapkv_compact_key_cache
+        value_cache = self._snapkv_compact_value_cache
+        if key_cache is None or value_cache is None:
+            return False
+
+        selected_len = selected_history.shape[1]
+        recent_len = min(self.snapkv_window_size, prompt_len)
+        kv_len = self._snapkv_compact_kv_len
+        generated_len = max(0, kv_len - selected_len - recent_len)
+        if kv_len == 0:
+            return False
+
+        device = query.device
+        k_dense = key_cache[:kv_len]
+        v_dense = value_cache[:kv_len]
+        cu_seqlens_q = torch.tensor([0, 1],
+                                    dtype=torch.int32,
+                                    device=device)
+        cu_seqlens_k = torch.tensor([0, kv_len],
+                                    dtype=torch.int32,
+                                    device=device)
+        descale_shape = (1, self.num_heads)
+
+        flash_attn_varlen_func(
+            q=query[:1].contiguous(),
+            k=k_dense.contiguous(),
+            v=v_dense.contiguous(),
+            out=output[:1],
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=1,
+            max_seqlen_k=kv_len,
+            softmax_scale=self.scale,
+            causal=False,
+            window_size=(-1, -1),
+            softcap=self.logits_soft_cap,
+            fa_version=self.vllm_flash_attn_version,
+            q_descale=layer._q_scale.expand(descale_shape),
+            k_descale=layer._k_scale.expand(descale_shape),
+            v_descale=layer._v_scale.expand(descale_shape),
+        )
+        self._snapkv_log_decode(layer, seq_len, prompt_len, selected_len,
+                                recent_len, generated_len, kv_len)
+        return True
 
     def _forward_encoder_attention(
         self,
